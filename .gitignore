@@ -27,3 +27,14 @@ __pycache__/
 reports/
 _scratch_*.txt
 scratch_*.txt
+
+# 社内向けの計画・決定・レビュー記録（Routine実行には不要・git管理外）
+TODO.md
+DECISIONS.md
+Routine化ロードマップ.md
+Routine化_不足実装まとめ.md
+相談内容.md
+プロジェクトレビュー_20260706.md
+修正項目一覧_20260706.md
+MILESTONE0_REPORT.md
+V0_PIPELINE_TEST_REPORT.md
