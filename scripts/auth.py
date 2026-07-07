@@ -1,4 +1,5 @@
 """Gmail/Sheets 共通の OAuth 認証ヘルパー（リポジトリルート相対で secrets/ を解決）。"""
+import json
 import os
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly",
 ]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -24,8 +26,16 @@ def _resolve(env_key: str, default: str) -> Path:
 
 
 def get_credentials() -> Credentials:
-    """GOOGLE_SERVICE_ACCOUNT_KEY があればサービスアカウント鍵で認証する（Routine実行想定）。
-    無ければ従来通り secrets/token.json のユーザーOAuthフローにフォールバックする（ローカル実行）。"""
+    """優先順位: (1) GOOGLE_OAUTH_TOKEN_JSON（token.jsonの中身そのものを環境変数として渡す。Routineの環境変数登録を想定）
+    → (2) GOOGLE_SERVICE_ACCOUNT_KEY（サービスアカウント鍵ファイル。当面未使用だが代替手段として残置）
+    → (3) 従来通り secrets/token.json のユーザーOAuthフロー（ローカル実行）。"""
+    token_json_env = os.environ.get("GOOGLE_OAUTH_TOKEN_JSON")
+    if token_json_env:
+        creds = Credentials.from_authorized_user_info(json.loads(token_json_env), SCOPES)
+        if not creds.valid and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        return creds
+
     service_account_key = os.environ.get("GOOGLE_SERVICE_ACCOUNT_KEY")
     if service_account_key:
         key_path = Path(service_account_key)
