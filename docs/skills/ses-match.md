@@ -6,12 +6,12 @@
 
 ## 1. 目的・位置づけ
 
-`案件台帳` を**全件読み**、要員プロフィール＋その場の**許容条件プロンプト**と照合してマッチング評価し、ランキングを画面表示・本人タブへ1行1案件で蓄積する。v0 パイプラインの第3スキル（実現2・方向A）。
+`案件台帳` から**要員ごとの差分**（前回マッチ以降に台帳へ入った案件。`--full` で全件）を読み、要員プロフィール＋その場の**許容条件プロンプト**と照合してマッチング評価し、ランキングを画面表示・本人タブへ1行1案件で蓄積する。v0 パイプラインの第3スキル（実現2・方向A）。差分カーソルの設計は `DECISIONS.md §9`。
 
 要員プロフィールは Google Drive（共有アイテム＞02.セールスマーケチーム＞99.営業支援(テスト)＞`稼働中`。フォルダID=`PROFILE_FOLDER_ID`）に置く。`稼働中`直下に**人員フォルダ**（フォルダ名＝要員名）が並び、各人員フォルダの中に`<要員名>.md`を1つ置く（フェーズ5-1）。**ローカルの`要員/<名前>.md`は参照しない**（Routine等リモート実行環境ではローカルフォルダを確認できないため。取得は常に`scripts/read_profile.py`経由でDriveから行う）。
 
 ```
-案件台帳(全件) + 稼働中フォルダの要員プロフィール(Drive) + 許容条件プロンプト → 【/ses-match 本スキル】
+案件台帳(要員ごと差分・DECISIONS §9) + 稼働中フォルダの要員プロフィール(Drive) + 許容条件プロンプト → 【/ses-match 本スキル】
    → 画面表示（ランキング） + data/matches/<名前>.jsonl → write_match.py → 本人タブ
 ```
 
@@ -32,9 +32,11 @@
 
 ## 4. 入力（データ契約）
 
-- **案件**: `scripts/read_sheet.py`（Windows: `.venv\Scripts\python.exe scripts\read_sheet.py` / macOS・Linux: `.venv/bin/python scripts/read_sheet.py`） → `案件台帳` 全件を、ヘッダー行をキーにした dict のリスト（JSON）で得る（列構成の変更に自動追従）。
-  - 注意: シェルの `>` リダイレクトは cp932 文字化けの恐れ。ツールの出力キャプチャで直接読むか、ファイル保存が必要なら UTF-8 でのファイル書き込みで行う。
-  - 件数が多い場合の分担は件数次第で判断してよいが、マッチング判断は業務理解が要るため基本はメインの会話で評価する（精度優先）。
+- **案件**: `scripts/read_sheet.py --person <名前>`（Windows: `.venv\Scripts\python.exe scripts\read_sheet.py --person <名前>` / macOS・Linux: `.venv/bin/python scripts/read_sheet.py --person <名前>`） → `案件台帳` から `_state.match_cursor.<名前>`（`ingested_at` 到達点）**以降の差分**を、ヘッダー行をキーにした dict のリスト（JSON）で得る（列構成の変更に自動追従）。カーソル未設定（初回）は全件。
+  - **stderr の `[cursor] high_water=<ISO>` を控える**（手順5の `--advance-cursor` に渡す）。読取自体はカーソルを進めない。
+  - プロフィール/許容条件を変えて出し直すときは `--person` の代わりに `--full`（全件・カーソル無視。手順5で `--advance-cursor` を渡さない）。
+  - 注意: stdout側 JSON のシェル `>` リダイレクトは cp932 文字化けの恐れ。ツールの出力キャプチャで直接読むか、ファイル保存が必要なら UTF-8 でのファイル書き込みで行う（`[cursor]` 行はstderr）。
+  - 件数が多い場合（初回の全件等）の分担は件数次第で判断してよいが、マッチング判断は業務理解が要るため基本はメインの会話で評価する（精度優先）。
 - **要員**: 箇条書き（スキル/経験年数/希望勤務地/希望単価/リモート希望/稼働開始 等）＋許容条件プロンプト。取得は常に`scripts/read_profile.py`（Windows: `.venv\Scripts\python.exe scripts\read_profile.py` / macOS・Linux: `.venv/bin/python scripts/read_profile.py`）経由でDriveから行う:
   1. **対象指定モード**: `read_profile.py <名前>` → 該当する人員フォルダの`<名前>.md`本文を標準出力する（人員フォルダ・プロフィールいずれかが無ければ`FileNotFoundError`）。
   2. **一括モード**: 引数なしで`read_profile.py`を実行 → `稼働中`直下の全人員フォルダを走査し、`[{"person_name": "...", "content": "..."}, ...]`のJSON配列を標準出力する。**人員フォルダ内に`<人員名>.md`が無いフォルダは、エラーにせず黙ってスキップされる**（スクリプト側の仕様。§9参照）。
@@ -62,13 +64,13 @@
 
 ## 6. 処理手順
 
-1. `read_sheet.py` で案件台帳を全件読む。
+1. `read_sheet.py --person <名前>` で案件台帳から差分（前回マッチ以降の新着案件）を読み、stderr の `[cursor] high_water=<ISO>` を控える（手順5で使う）。全件を見直すときは `--full`。
 2. 要員プロフィールを取得する（§2のモード判定に従う）:
    - 対象指定モード: `read_profile.py <名前>` で1名分を取得。
-   - 一括モード: `read_profile.py`（引数なし）で`稼働中`フォルダ全員分を一度に取得。
-3. 対象者（1名または複数名）それぞれについて、§5 の基準で全案件を評価しランキングする。許容条件プロンプトは対象指定モードのみ適用。
-4. 対象者ごとに `data/matches/<名前>.jsonl` へ1行1案件で書き出す（既存ファイルがあれば末尾追記。write_match 側で row_key dedup されるため再掲しても二重行にはならない）。
-5. 対象者ごとに `scripts/write_match.py <要員名>` で本人タブへ反映（Windows: `.venv\Scripts\python.exe scripts\write_match.py <要員名>` / macOS・Linux: `.venv/bin/python scripts/write_match.py <要員名>`）。
+   - 一括モード: `read_profile.py`（引数なし）で`稼働中`フォルダ全員分を一度に取得。※ 一括モードでも案件は要員ごとに `read_sheet.py --person <名前>` で差分取得する（カーソルが要員別のため）。
+3. 対象者（1名または複数名）それぞれについて、§5 の基準で取得した差分案件を評価しランキングする。許容条件プロンプトは対象指定モードのみ適用。
+4. 対象者ごとに `data/matches/<名前>.jsonl` へ1行1案件で書き出す（既存ファイルがあれば末尾追記。write_match 側で row_key dedup されるため再掲しても二重行にはならない）。差分にマッチ0件でも手順5でカーソルを前進させる。
+5. 対象者ごとに `scripts/write_match.py <要員名> --advance-cursor <手順1のhigh_water>` で本人タブへ反映＋カーソル前進（Windows: `.venv\Scripts\python.exe scripts\write_match.py <要員名> --advance-cursor <ISO>` / macOS・Linux: `.venv/bin/python scripts/write_match.py <要員名> --advance-cursor <ISO>`）。追記→カーソル前進の順（overlap 10分を差し引いて保存）。マッチ0件でも `--advance-cursor` を渡す。`--full` 再マッチ時は `--advance-cursor` を渡さない。
 6. §8 のルールで対象者ごとに画面報告（一括モードでは対象者全体の集計も冒頭に示す）。
 
 ## 7. 出力（データ契約）
@@ -117,5 +119,6 @@
 
 - 方向B（案件→人材・`マッチ結果` タブ）→ 将来。
 - `person_id` 主キー・行ロック（TOCTOU回避）→ backlog（v0 はタブ名＝要員名）。
-- 鮮度TTL（古い案件の減点・除外）・粗フィルタ緩和（隣接県表）・スキル正準辞書 → backlog（v0 は全件を Claude が読む）。
+- **要員ごと差分カーソル（②・`ingested_at` 基準）は実装済み**（2026-07-08・DECISIONS §9）。鮮度TTL（①・`received_at` 基準で古い案件を除外）・粗フィルタ緩和（隣接県表）・スキル正準辞書 → backlog。
+- 一括モードの単一読取＋カーソル別パーティション化（今は要員ごとに read_sheet を呼ぶ）→ backlog。
 - 単一マッチ結果タブへの移行（人員タブ>30）→ backlog。

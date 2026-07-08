@@ -181,6 +181,26 @@ def get_budget_status(sheets, sheet_id: str) -> dict:
     }
 
 
+# --- 差分マッチ（要員→案件）のカーソル（DECISIONS §9） ---
+# key=match_cursor.<要員名>・value=ISO8601(JST) の ingested_at 到達点。
+# 未設定=空文字=未実行=全件対象（新規要員のオンボーディング）。
+
+MATCH_CURSOR_PREFIX = "match_cursor."
+
+
+def get_match_cursor(sheets, sheet_id: str, person: str) -> str:
+    """要員 person のマッチ差分カーソル（ingested_at 到達点・ISO8601）を返す。
+    未設定なら空文字（＝未実行＝全件対象）。"""
+    state = _read_state(sheets, sheet_id)
+    return state.get(f"{MATCH_CURSOR_PREFIX}{person}", "")
+
+
+def set_match_cursor(sheets, sheet_id: str, person: str, iso: str, owner: str = None) -> None:
+    """要員 person のマッチ差分カーソルを iso（ingested_at・ISO8601）へ更新する。"""
+    owner = owner or current_owner()
+    _write_state(sheets, sheet_id, {f"{MATCH_CURSOR_PREFIX}{person}": iso}, owner)
+
+
 def _append_runlog(sheets, sheet_id: str, row: list) -> None:
     sheets.spreadsheets().values().append(
         spreadsheetId=sheet_id,

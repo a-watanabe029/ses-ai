@@ -4,20 +4,24 @@
 - タブが無ければ見出し行付きで新規作成
 - 既存の「案件row_key(messageId)」列で重複回避（再実行は新規のみ・既存行の手動ステータスは保持）
 """
+import argparse
 import json
 import os
-import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
 
+import state as st
 from auth import get_credentials
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MATCHES_DIR = REPO_ROOT / "data" / "matches"
 JST = timezone(timedelta(hours=9))
+# 差分マッチのカーソルを前進させる際、高水位から差し引く再スキャン幅（DECISIONS §9）。
+# 複数PCのクロックスキュー・同時追記で ingested_at が厳密単調でない場合の取りこぼし対策。
+CURSOR_OVERLAP = timedelta(minutes=10)
 
 MATCH_HEADERS = [
     "記載日", "適合度", "案件名", "単価", "勤務地", "リモート", "商流",
@@ -108,11 +112,28 @@ def append_matches(sheets, sheet_id: str, person_name: str, matches: list) -> in
     return len(new_rows)
 
 
+def _apply_overlap(iso: str) -> str:
+    """高水位 ISO から CURSOR_OVERLAP を引いた ISO を返す（クロックスキュー対策）。
+    パースできなければそのまま返す（安全側＝カーソルは進むが overlap 無し）。"""
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        return iso
+    return (dt - CURSOR_OVERLAP).isoformat()
+
+
 def main() -> None:
-    if len(sys.argv) != 2:
-        print("Usage: python write_match.py <要員名>", file=sys.stderr)
-        sys.exit(1)
-    person_name = sys.argv[1]
+    parser = argparse.ArgumentParser(
+        description="マッチ結果を人員タブへ追記（messageId dedup）"
+    )
+    parser.add_argument("person_name", help="要員名（＝タブ名・data/matches/<名前>.jsonl）")
+    parser.add_argument(
+        "--advance-cursor", dest="advance_cursor",
+        help="追記成功後に _state の match_cursor.<名前> をこの高水位ISOへ前進"
+             "（overlap 10分を差し引いて保存。read_sheet.py の [cursor] high_water= を渡す）",
+    )
+    args = parser.parse_args()
+    person_name = args.person_name
 
     load_dotenv(REPO_ROOT / ".env")
     sheet_id = os.environ["SHEET_ID"]
@@ -120,9 +141,24 @@ def main() -> None:
     creds = get_credentials()
     sheets = build("sheets", "v4", credentials=creds)
 
-    matches = _load_matches(person_name)
+    # 差分を評価したがマッチ0件だった場合、結果ファイルが無い/空でも
+    # カーソルは前進させたい（再評価ループ防止）。--advance-cursor 指定時のみ許容。
+    try:
+        matches = _load_matches(person_name)
+    except FileNotFoundError:
+        if not args.advance_cursor:
+            raise
+        matches = []
+        print(f"[note] {person_name}: マッチ結果ファイルが無いため追記0件（--advance-cursor によりカーソルのみ前進）。")
+
     appended = append_matches(sheets, sheet_id, person_name, matches)
     print(f"Appended {appended} rows to tab '{person_name}' ({len(matches) - appended} skipped as duplicates).")
+
+    # 追記成功後にカーソルを前進（追記→前進の順。途中クラッシュは次回再スキャンで回収。DECISIONS §9）。
+    if args.advance_cursor:
+        cursor = _apply_overlap(args.advance_cursor)
+        st.set_match_cursor(sheets, sheet_id, person_name, cursor)
+        print(f"match_cursor.{person_name} を {cursor} へ前進（高水位 {args.advance_cursor} − overlap {CURSOR_OVERLAP}）。")
 
 
 if __name__ == "__main__":
