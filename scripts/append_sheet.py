@@ -24,6 +24,7 @@ PARSED_DIR = REPO_ROOT / "data" / "parsed"
 JST = timezone(timedelta(hours=9))
 PROCESSED_LABEL = "SES-AI/processed"
 SHEET_NAME = "案件台帳"
+DRYRUN_SHEET_NAME = "案件台帳_dryrun"  # --dry-run 時の書き込み先（本番台帳を汚さない・処理後は手動削除可）
 
 ANKEN_HEADERS = [
     "row_key", "ingested_at", "received_at", "source_from", "source_email",
@@ -194,11 +195,35 @@ def _load_jsonl_dir(dir_path: Path) -> list:
     return records
 
 
-def _existing_row_keys(sheets, sheet_id: str) -> set:
+def _existing_row_keys(sheets, sheet_id: str, sheet_name: str = SHEET_NAME) -> set:
     resp = sheets.spreadsheets().values().get(
-        spreadsheetId=sheet_id, range=f"{SHEET_NAME}!A2:A"
+        spreadsheetId=sheet_id, range=f"{sheet_name}!A2:A"
     ).execute()
     return {row[0] for row in resp.get("values", []) if row}
+
+
+def _ensure_anken_tab(sheets, sheet_id: str, sheet_name: str) -> None:
+    """指定タブが無ければ見出し行付きで作成する（--dry-run のテスト用タブ用）。
+    本番の 案件台帳 は setup_v0a.py で作成済みの想定なので通常は何もしない。"""
+    meta = sheets.spreadsheets().get(
+        spreadsheetId=sheet_id, fields="sheets.properties.title"
+    ).execute()
+    tabs = {s["properties"]["title"] for s in meta.get("sheets", [])}
+    if sheet_name not in tabs:
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]},
+        ).execute()
+        print(f"Tab created: {sheet_name}")
+    header_resp = sheets.spreadsheets().values().get(
+        spreadsheetId=sheet_id, range=f"{sheet_name}!A1:A1"
+    ).execute()
+    if not header_resp.get("values"):
+        sheets.spreadsheets().values().update(
+            spreadsheetId=sheet_id, range=f"{sheet_name}!A1",
+            valueInputOption="RAW", body={"values": [ANKEN_HEADERS]},
+        ).execute()
+        print(f"Header written: {sheet_name}")
 
 
 def _gmail_link(message_id: str) -> str:
@@ -246,8 +271,9 @@ def _build_row(parsed: dict, inbox_index: dict, warnings: list) -> list:
     return [row.get(h, "") for h in ANKEN_HEADERS]
 
 
-def append_new_rows(sheets, sheet_id: str, parsed_records: list, inbox_index: dict) -> tuple:
-    existing = _existing_row_keys(sheets, sheet_id)
+def append_new_rows(sheets, sheet_id: str, parsed_records: list, inbox_index: dict,
+                    sheet_name: str = SHEET_NAME) -> tuple:
+    existing = _existing_row_keys(sheets, sheet_id, sheet_name)
     new_rows = []
     warnings = []
     for parsed in parsed_records:
@@ -260,7 +286,7 @@ def append_new_rows(sheets, sheet_id: str, parsed_records: list, inbox_index: di
     if new_rows:
         sheets.spreadsheets().values().append(
             spreadsheetId=sheet_id,
-            range=f"{SHEET_NAME}!A1",
+            range=f"{sheet_name}!A1",
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": new_rows},
@@ -287,12 +313,25 @@ def label_all_inbox_messages(gmail, message_ids: list) -> int:
 
 
 def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help=f"本番 {SHEET_NAME} でなく {DRYRUN_SHEET_NAME} タブへ書き込み、processed ラベル付与も行わない（テスト用）",
+    )
+    args = parser.parse_args()
+    dry_run = args.dry_run
+    target_sheet = DRYRUN_SHEET_NAME if dry_run else SHEET_NAME
+
     load_dotenv(REPO_ROOT / ".env")
     sheet_id = os.environ["SHEET_ID"]
 
     creds = get_credentials()
     sheets = build("sheets", "v4", credentials=creds)
     gmail = build("gmail", "v1", credentials=creds)
+
+    # _state/_runlog タブが無い環境（新規シート・Routine等）でも動くよう冪等に用意する。
+    st.ensure_state_tabs(sheets, sheet_id)
 
     owner = st.current_owner()
     inbox_records = _load_jsonl_dir(INBOX_DIR)
@@ -315,15 +354,25 @@ def main() -> None:
             return
         inbox_index = {r["messageId"]: r for r in inbox_records}
 
+        if dry_run:
+            print(f"[DRY-RUN] 本番 {SHEET_NAME} には書き込みません。書き込み先: {target_sheet} タブ。ラベル付与もスキップします。")
+            _ensure_anken_tab(sheets, sheet_id, target_sheet)
+
         parsed_records = _load_jsonl_dir(PARSED_DIR)
-        appended_count, warnings = append_new_rows(sheets, sheet_id, parsed_records, inbox_index)
-        print(f"Appended {appended_count} rows to {SHEET_NAME}.")
+        appended_count, warnings = append_new_rows(
+            sheets, sheet_id, parsed_records, inbox_index, sheet_name=target_sheet
+        )
+        print(f"Appended {appended_count} rows to {target_sheet}.")
         for w in warnings:
             print(f"[warn] {w}")
 
-        labeled_count = label_all_inbox_messages(gmail, list(inbox_index.keys()))
-        print(f"Labeled {labeled_count} messages as {PROCESSED_LABEL}.")
-        count_processed = labeled_count
+        if dry_run:
+            print(f"[DRY-RUN] processed ラベル付与をスキップしました（対象 {len(inbox_index)} 通は未処理のまま）。")
+            count_processed = appended_count
+        else:
+            labeled_count = label_all_inbox_messages(gmail, list(inbox_index.keys()))
+            print(f"Labeled {labeled_count} messages as {PROCESSED_LABEL}.")
+            count_processed = labeled_count
         status = "success"
 
         # 1バッチサイクルの正常な終了点＝ここでセッションロックを解放する。

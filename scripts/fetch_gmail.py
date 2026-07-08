@@ -227,6 +227,10 @@ def main() -> None:
     gmail = build("gmail", "v1", credentials=creds)
     sheets = build("sheets", "v4", credentials=creds)
 
+    # _state/_runlog タブが無い環境（新規シート・Routine等）でも動くよう、
+    # log_run_start より前に冪等に用意する（既存値は上書きしない）。
+    st.ensure_state_tabs(sheets, sheet_id)
+
     owner = st.current_owner()
     # 予算の要求件数: --limit未指定時は「実質無制限」を表す大きな値を渡す
     # （日次予算の残量で自動的に頭打ちになる）
