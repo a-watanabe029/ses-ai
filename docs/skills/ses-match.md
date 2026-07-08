@@ -81,13 +81,13 @@
 2. 各 target を**1名ずつ順に**（並列化しない）:
    - a. `target.delta`（その人の差分案件）を `target.profile`（本人条件）と §5 の基準で評価する。差分0件なら評価スキップ（c のカーソル前進のみ）。
    - b. `data/matches/<person_name>.jsonl` へ1行1案件で書き出す（row_key dedup 済み）。
-   - c. `write_match.py <person_name> --advance-cursor <high_water>` で本人タブへ反映＋カーソル前進（`high_water` は match_prepare の全員共通値・追記→前進の順・overlap 10分差引・マッチ0件でも渡す）。
+   - c. `write_match.py <person_name> --advance-cursor <high_water>` で本人タブへ反映＋カーソル前進（`high_water` は match_prepare の全員共通値・追記→前進の順・overlap なし＝カーソル=high_water・マッチ0件でも渡す）。
 3. §8 のルールで対象者ごとに画面報告（冒頭に対象N名／スキップM名の全体集計）。
 
 **対象指定モード（1名を名指し・許容条件を個別適用）**:
 1. `read_profile.py <名前>`（本人条件）＋ `read_sheet.py --person <名前>`（差分案件・stderr の `[cursor] high_water` を控える）。許容条件プロンプトを適用。
 2. §5 の基準で評価 → `data/matches/<名前>.jsonl`。
-3. `write_match.py <名前> --advance-cursor <read_sheetのhigh_water>` で反映＋前進（追記→前進・overlap 10分差引・マッチ0件でも渡す）。
+3. `write_match.py <名前> --advance-cursor <read_sheetのhigh_water>` で反映＋前進（追記→前進・overlap なし＝カーソル=high_water・マッチ0件でも渡す）。
 4. §8 のルールで画面報告。
 
 **全件で再マッチ（スキル/プロフィール編集後）**: 差分は既定。全件は「カーソルを消す＝次回の通常ランがそのまま全件になる」で行う（別モードは持たない）。

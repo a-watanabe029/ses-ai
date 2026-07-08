@@ -19,9 +19,6 @@ from auth import get_credentials
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MATCHES_DIR = REPO_ROOT / "data" / "matches"
 JST = timezone(timedelta(hours=9))
-# 差分マッチのカーソルを前進させる際、高水位から差し引く再スキャン幅（DECISIONS §9）。
-# 複数PCのクロックスキュー・同時追記で ingested_at が厳密単調でない場合の取りこぼし対策。
-CURSOR_OVERLAP = timedelta(minutes=10)
 
 MATCH_HEADERS = [
     "記載日", "適合度", "案件名", "単価", "勤務地", "リモート", "商流",
@@ -112,16 +109,6 @@ def append_matches(sheets, sheet_id: str, person_name: str, matches: list) -> in
     return len(new_rows)
 
 
-def _apply_overlap(iso: str) -> str:
-    """高水位 ISO から CURSOR_OVERLAP を引いた ISO を返す（クロックスキュー対策）。
-    パースできなければそのまま返す（安全側＝カーソルは進むが overlap 無し）。"""
-    try:
-        dt = datetime.fromisoformat(iso)
-    except ValueError:
-        return iso
-    return (dt - CURSOR_OVERLAP).isoformat()
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="マッチ結果を人員タブへ追記（messageId dedup）"
@@ -130,7 +117,7 @@ def main() -> None:
     parser.add_argument(
         "--advance-cursor", dest="advance_cursor",
         help="追記成功後に _state の match_cursor.<名前> をこの高水位ISOへ前進"
-             "（overlap 10分を差し引いて保存。read_sheet.py の [cursor] high_water= を渡す）",
+             "（read_sheet.py / match_prepare.py の high_water をそのまま保存）",
     )
     args = parser.parse_args()
     person_name = args.person_name
@@ -155,10 +142,11 @@ def main() -> None:
     print(f"Appended {appended} rows to tab '{person_name}' ({len(matches) - appended} skipped as duplicates).")
 
     # 追記成功後にカーソルを前進（追記→前進の順。途中クラッシュは次回再スキャンで回収。DECISIONS §9）。
+    # 高水位そのままを保存する（overlap は入れない）。カーソル＝最新行の ingested_at と一致するので、
+    # 次回 `ingested_at > cursor` で最新バッチが正しく除外され、新着が無ければ差分0になる。
     if args.advance_cursor:
-        cursor = _apply_overlap(args.advance_cursor)
-        st.set_match_cursor(sheets, sheet_id, person_name, cursor)
-        print(f"match_cursor.{person_name} を {cursor} へ前進（高水位 {args.advance_cursor} − overlap {CURSOR_OVERLAP}）。")
+        st.set_match_cursor(sheets, sheet_id, person_name, args.advance_cursor)
+        print(f"match_cursor.{person_name} を {args.advance_cursor} へ前進。")
 
 
 if __name__ == "__main__":
