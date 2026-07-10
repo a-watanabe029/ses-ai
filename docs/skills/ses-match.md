@@ -34,18 +34,19 @@
 
 モードで取得手段が分かれる（Windows は `.venv\Scripts\python.exe`、macOS・Linux は `.venv/bin/python` を頭に付ける）。
 
-**一括モード（既定・Routine無人実行）** — 稼働中フォルダ全員ぶんを1コマンドで束ねる: `scripts/match_prepare.py` → stdout に
+**一括モード（既定・Routine無人実行）** — 稼働中フォルダ全員ぶんを1コマンドで束ね、**評価入力を要員ごとのファイルに分割**する: `scripts/match_prepare.py --emit-inputs`（既定 DIR=`data/matches/_input`）→ delta>0 の各要員の入力（`profile`＋`delta`）を `data/matches/_input/<名前>.json` に書き出し、stdout は **delta を含まない軽量マニフェスト**:
 
 ```json
 {"high_water": "<台帳最新ingested_at・全員共通>",
  "targets": [{"person_name": "...", "cursor": "<現在のカーソル・空=初回全件>",
-              "delta_count": N, "profile": "<md本文>", "delta": [ {案件dict}, ... ]}, ...]}
+              "delta_count": N, "input_file": "data/matches/_input/<名前>.json (delta0はnull)"}, ...]}
 ```
 
-- 各 `delta` はその要員の `match_cursor.<名前>` 基準の差分（**要員ごとに範囲が違う**。カーソル空＝新規要員は初回全件）。`profile` は本人条件（Drive `<名前>.md`）。`high_water` は**全員共通**で手順2cのカーソル前進に使う。
+- 入力ファイル `data/matches/_input/<名前>.json` にその要員の `profile`（本人条件・Drive `<名前>.md`）＋ `delta`（`match_cursor.<名前>` 基準の差分案件・**要員ごとに範囲が違う**・カーソル空＝新規要員は初回全件）＋ `high_water` が入る。マニフェスト自体は delta を持たない（**並列サブエージェントに1要員=1ファイルで渡し、本体コンテキストに大量の delta を載せない**ため・§6 手順2）。
+- `input_file` が **null**（`delta_count`=0）の要員は評価不要（手順2cのカーソル前進のみ）。`high_water` は**全員共通**で手順2cのカーソル前進に使う。
 - 案件台帳は**1回だけ**読む（要員ごとのSheets読みを避ける）。`<名前>.md` の無い人員フォルダは `[skip]` を stderr に出してスキップ（§9）。
 - `--full` で全 target を全件（スキル編集後の再マッチ。通常は §6 の `match-cursor reset` を使う）。
-- 許容条件プロンプトの個別適用はできない（一括のため）。stdout(JSON) は `>` リダイレクトでなく UTF-8 ファイル書き込み＋読取で（cp932文字化け防止）。`[skip]`/`[match_prepare]` は stderr。
+- 許容条件プロンプトの個別適用はできない（一括のため）。stdout(マニフェスト) は `>` リダイレクトでなく UTF-8 ファイル書き込み＋読取で（cp932文字化け防止）。`[skip]`/`[match_prepare]` は stderr。
 
 **対象指定モード（1名を名指し／許容条件を個別適用）**:
 - **案件**: `scripts/read_sheet.py --person <名前>` → `案件台帳` から `match_cursor.<名前>` 以降の差分（dictのJSONリスト・列変更に自動追従）。カーソル未設定は全件。**stderr の `[cursor] high_water=<ISO>` を控える**（手順2dで使う）。読取自体はカーソルを進めない。`--full` で全件。cp932対策は上と同様。
@@ -76,13 +77,15 @@
 
 各対象者について「**その人の差分案件 × その人の本人条件**」を評価し、**その人のタブ**へ追記して**その人のカーソル**を進める（人ごとに独立・差分がデフォルト）。
 
-**一括モード（既定・稼働中フォルダ全員）**:
-1. `match_prepare.py` を実行し `{high_water, targets:[...]}` を得る（人員を名指ししない＝稼働中の登録者が自動対象。人が増減してもコマンド不変）。
-2. 各 target を**1名ずつ順に**（並列化しない）:
-   - a. `target.delta`（その人の差分案件）を `target.profile`（本人条件）と §5 の基準で評価する。差分0件なら評価スキップ（c のカーソル前進のみ）。
-   - b. `data/matches/<person_name>.jsonl` へ1行1案件で書き出す（row_key dedup 済み）。
-   - c. `write_match.py <person_name> --advance-cursor <high_water>` で本人タブへ反映＋カーソル前進（`high_water` は match_prepare の全員共通値・追記→前進の順・overlap なし＝カーソル=high_water・マッチ0件でも渡す）。
-3. §8 のルールで対象者ごとに画面報告（冒頭に対象N名／スキップM名の全体集計）。
+**一括モード（既定・稼働中フォルダ全員／評価は並列・書込みは直列）**: 評価（マッチング判定）を要員ごとに並列で行い、Sheets（本人タブ・`人員一覧`）と `_state`（カーソル）への書込みは本体で1名ずつ直列に行う。**共有タブ・`_state` はタブ丸ごと read-modify-write で更新されるため、並列書込みは lost update を招く**（→ サブエージェントは評価と `data/matches/<名前>.jsonl` 書き出しのみ・Sheets/`_state` には触らせない）。
+
+1. `match_prepare.py --emit-inputs` を実行し `{high_water, targets:[...]}`（軽量マニフェスト）＋各要員の入力ファイルを得る（人員を名指ししない＝稼働中の登録者が自動対象。人が増減してもコマンド不変）。
+2. **評価（並列）**: マニフェストの `input_file` が非 null の各要員につき、**1要員=1サブエージェントを並列起動**。各サブエージェントは:
+   - a. `data/matches/_input/<名前>.json`（`profile`＋`delta`＋`high_water`）を Read し、§5 の基準で各案件を評価する。
+   - b. `data/matches/<person_name>.jsonl` へ1行1案件で書き出す（row_key dedup 済み）。**Sheets・`_state`・`write_match.py` には一切触れない**。
+   - サブエージェントのプロンプトには §5（評価軸・判定ルール・許容条件の扱い・国籍/年齢/性別の非足切り）と §7 の出力フォーマットを省略せず渡す。`input_file`=null（差分0件）の要員は評価不要（手順2cのカーソル前進のみ）。
+3. **書込み（直列・全サブエージェント完了後）**: 対象者を**1名ずつ順に**、`write_match.py <person_name> --advance-cursor <high_water>` で本人タブへ反映＋カーソル前進（`high_water` は match_prepare の全員共通値・追記→前進の順・overlap なし＝カーソル=high_water・マッチ0件でも渡す）。**ここが唯一の Sheets／`_state` 書込み地点**。
+4. §8 のルールで対象者ごとに画面報告（冒頭に対象N名／スキップM名の全体集計）。
 
 **対象指定モード（1名を名指し・許容条件を個別適用）**:
 1. `read_profile.py <名前>`（本人条件）＋ `read_sheet.py --person <名前>`（差分案件・stderr の `[cursor] high_water` を控える）。許容条件プロンプトを適用。
@@ -145,4 +148,5 @@
 - `person_id` 主キー・行ロック（TOCTOU回避）→ backlog（v0 はタブ名＝要員名）。
 - **要員ごと差分カーソル（②・`ingested_at` 基準）は実装済み**（2026-07-08・DECISIONS §9）。鮮度TTL（①・`received_at` 基準で古い案件を除外）・粗フィルタ緩和（隣接県表）・スキル正準辞書 → backlog。
 - 一括モードの単一読取＋カーソル別パーティション化（`match_prepare.py`）→ **実装済み**（2026-07-08）。台帳1回読みで稼働中全員ぶんの差分を束ねる。
+- 一括モードの**評価並列化（要員ごとサブエージェント）＋書込み直列**（`match_prepare.py --emit-inputs`→並列評価→本体が `write_match.py` を1名ずつ）→ **実装済み**（2026-07-10）。評価は並列・共有リソース（Sheets/`_state`）書込みは直列で lost update を回避。書込みまで並列化する場合の per-cell `_state` 更新・楽観ロックは backlog。
 - 単一マッチ結果タブへの移行（人員タブ>30）→ backlog。
