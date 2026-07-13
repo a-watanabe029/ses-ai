@@ -3,6 +3,7 @@
 - 入力: data/matches/<要員名>.jsonl（Claude が評価・作成した1行1案件のマッチ結果）
 - タブが無ければ見出し行付きで新規作成
 - 既存の「案件row_key(messageId)」列で重複回避（再実行は新規のみ・既存行の手動ステータスは保持）
+- 名簿 `人員一覧` を upsert（新規要員は行追加・既存要員は件数更新。タブへのリンク付き）
 """
 import argparse
 import json
@@ -27,6 +28,9 @@ MATCH_HEADERS = [
 ]
 KEY_COL = "案件row_key(messageId)"
 
+ROSTER_TAB = "人員一覧"
+ROSTER_HEADERS = ["名前", "タブリンク", "件数"]
+
 
 def _load_matches(person_name: str) -> list:
     path = MATCHES_DIR / f"{person_name}.jsonl"
@@ -41,23 +45,31 @@ def _load_matches(person_name: str) -> list:
     return records
 
 
-def _ensure_tab(sheets, sheet_id: str, person_name: str) -> None:
-    meta = sheets.spreadsheets().get(spreadsheetId=sheet_id, fields="sheets.properties.title").execute()
-    tabs = [s["properties"]["title"] for s in meta.get("sheets", [])]
+def _ensure_tab(sheets, sheet_id: str, person_name: str) -> int:
+    """人員タブを用意し、その sheetId(gid) を返す（名簿のリンク生成に使う）。"""
+    meta = sheets.spreadsheets().get(
+        spreadsheetId=sheet_id, fields="sheets.properties(title,sheetId)"
+    ).execute()
+    gid_by_title = {
+        s["properties"]["title"]: s["properties"]["sheetId"] for s in meta.get("sheets", [])
+    }
 
-    if person_name not in tabs:
-        sheets.spreadsheets().batchUpdate(
+    if person_name not in gid_by_title:
+        resp = sheets.spreadsheets().batchUpdate(
             spreadsheetId=sheet_id,
             body={"requests": [{"addSheet": {"properties": {"title": person_name}}}]},
         ).execute()
+        tab_gid = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
         print(f"Tab created: {person_name}")
+    else:
+        tab_gid = gid_by_title[person_name]
 
     # タブが既存でも、見出し行が無ければ（=手動作成の空タブ等）ここで補完する
     header_resp = sheets.spreadsheets().values().get(
         spreadsheetId=sheet_id, range=f"{person_name}!A1:A1"
     ).execute()
     if header_resp.get("values"):
-        return
+        return tab_gid
 
     sheets.spreadsheets().values().update(
         spreadsheetId=sheet_id,
@@ -66,6 +78,74 @@ def _ensure_tab(sheets, sheet_id: str, person_name: str) -> None:
         body={"values": [MATCH_HEADERS]},
     ).execute()
     print(f"Header written: {person_name}")
+    return tab_gid
+
+
+def _ensure_roster_tab(sheets, sheet_id: str) -> None:
+    """名簿タブ `人員一覧` と見出し行を用意する（無ければ作成）。"""
+    meta = sheets.spreadsheets().get(
+        spreadsheetId=sheet_id, fields="sheets.properties.title"
+    ).execute()
+    tabs = [s["properties"]["title"] for s in meta.get("sheets", [])]
+
+    if ROSTER_TAB not in tabs:
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": ROSTER_TAB}}}]},
+        ).execute()
+        print(f"Tab created: {ROSTER_TAB}")
+
+    header_resp = sheets.spreadsheets().values().get(
+        spreadsheetId=sheet_id, range=f"{ROSTER_TAB}!A1:A1"
+    ).execute()
+    if header_resp.get("values"):
+        return
+
+    sheets.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{ROSTER_TAB}!A1",
+        valueInputOption="RAW",
+        body={"values": [ROSTER_HEADERS]},
+    ).execute()
+    print(f"Header written: {ROSTER_TAB}")
+
+
+def _upsert_roster(sheets, sheet_id: str, person_name: str, tab_gid: int, count: int) -> None:
+    """名簿 `人員一覧` を upsert（新規要員は行追加・既存要員は件数更新）。
+
+    タブ名＝要員名で突合。`タブリンク` は本人タブへ飛ぶ HYPERLINK 数式。
+    ses-match は要員を1名ずつ順に処理する（並列化しない）ため read→write の競合は起きない。
+    """
+    _ensure_roster_tab(sheets, sheet_id)
+
+    resp = sheets.spreadsheets().values().get(
+        spreadsheetId=sheet_id, range=f"{ROSTER_TAB}!A2:A"
+    ).execute()
+    names = [row[0] if row else "" for row in resp.get("values", [])]
+
+    link = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit#gid={tab_gid}"
+    safe_name = person_name.replace('"', '""')
+    link_formula = f'=HYPERLINK("{link}","{safe_name}")'
+    row_values = [[person_name, link_formula, count]]
+
+    if person_name in names:
+        row_num = names.index(person_name) + 2  # A2 が names[0]
+        sheets.spreadsheets().values().update(
+            spreadsheetId=sheet_id,
+            range=f"{ROSTER_TAB}!A{row_num}",
+            valueInputOption="USER_ENTERED",
+            body={"values": row_values},
+        ).execute()
+        print(f"Roster updated: {person_name} (件数={count})")
+    else:
+        sheets.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range=f"{ROSTER_TAB}!A1",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": row_values},
+        ).execute()
+        print(f"Roster added: {person_name} (件数={count})")
 
 
 def _existing_row_keys(sheets, sheet_id: str, person_name: str) -> set:
@@ -87,7 +167,7 @@ def _build_row(match: dict) -> list:
 
 
 def append_matches(sheets, sheet_id: str, person_name: str, matches: list) -> int:
-    _ensure_tab(sheets, sheet_id, person_name)
+    tab_gid = _ensure_tab(sheets, sheet_id, person_name)
     existing = _existing_row_keys(sheets, sheet_id, person_name)
 
     new_rows = []
@@ -106,6 +186,11 @@ def append_matches(sheets, sheet_id: str, person_name: str, matches: list) -> in
             insertDataOption="INSERT_ROWS",
             body={"values": new_rows},
         ).execute()
+
+    # 名簿 `人員一覧` を upsert（新規要員は行追加・既存要員は件数更新）。
+    # 件数＝本人タブの一意 row_key 総数（既存＋今回追記）。マッチ0件の新規要員も
+    # タブが作られるので名簿に 件数=0 で載せる（＝新規要員の追加が名簿へ反映される）。
+    _upsert_roster(sheets, sheet_id, person_name, tab_gid, len(existing))
 
     return len(new_rows)
 
